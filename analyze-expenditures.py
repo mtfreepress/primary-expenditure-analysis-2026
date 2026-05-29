@@ -11,6 +11,9 @@ Writes:
   One file per committee; every row that references ≥1 contested-primary candidate.
   Original fields are preserved plus four appended columns:
     Matched Candidate | Matched District | Matched Party | Matched Race
+
+    output/all-contested-primary.csv
+    A single consolidated file containing all matched contested-primary rows.
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ from pathlib import Path
 
 INPUT_DIR = Path("input")
 OUTPUT_DIR = Path("output/contested-primaries/by-committee")
+ALL_CONTESTED_FILE = Path("output/all-contested-primary.csv")
 EXPENDITURES_FILE = INPUT_DIR / "committee-expenditures.csv"
 CANDIDATES_FILE = INPUT_DIR / "contested-primaries-candidates.csv"
 
@@ -337,6 +341,7 @@ def main() -> None:
     out_fields = fieldnames + extra_cols
 
     by_committee: dict[str, list[dict]] = defaultdict(list)
+    all_matched_rows: list[dict] = []
     matched_count = 0
     unmatched_issues: list[str] = []
 
@@ -359,6 +364,7 @@ def main() -> None:
         out["Matched Race"] = " | ".join(c["race"] for c in candidates)
         committee = row.get("Committee", "UNKNOWN").strip() or "UNKNOWN"
         by_committee[committee].append(out)
+        all_matched_rows.append(out)
 
     print(f"  {matched_count} rows matched → {len(by_committee)} committees")
 
@@ -372,6 +378,14 @@ def main() -> None:
             writer.writerows(committee_rows)
 
     print(f"Wrote {len(by_committee)} files to {OUTPUT_DIR}/")
+
+    # Write one consolidated CSV with all matched rows.
+    ALL_CONTESTED_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(ALL_CONTESTED_FILE, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=out_fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(all_matched_rows)
+    print(f"Wrote consolidated file to {ALL_CONTESTED_FILE}")
 
     # Show a sample of unmatched non-empty Candidate Issue values (for debugging)
     unique_unmatched = sorted(set(unmatched_issues))
