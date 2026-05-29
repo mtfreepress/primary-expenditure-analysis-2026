@@ -32,6 +32,12 @@ ALL_CONTESTED_FILE = Path("output/all-contested-primary.csv")
 EXPENDITURES_FILE = INPUT_DIR / "committee-expenditures.csv"
 CANDIDATES_FILE = INPUT_DIR / "contested-primaries-candidates.csv"
 
+# ── Conservatives4MT supplemental-spending files ──────────────────────────────
+C4MT_COMMITTEE = "Conservatives4MT"
+C4MT_PROSPER_FILE = INPUT_DIR / "conservatives-4-mt-prosper-spending.csv"
+C4MT_EDGE_APRIL_FILE = INPUT_DIR / "conservatives-4-mt-edge-spending-april.csv"
+C4MT_EDGE_MAY_FILE = INPUT_DIR / "conservatives-4-mt-edge-spending-may.csv"
+
 # Minimum similarity ratio for fuzzy last-name matching (typo tolerance).
 # 0.70 catches transposition typos (BUTTERY/BUTTREY) and near-misses (STANKEY/STANEK).
 FUZZY_LAST_THRESHOLD = 0.70
@@ -320,6 +326,140 @@ def _safe_filename(name: str) -> str:
     return sanitized.strip(". ") or "UNKNOWN"
 
 
+# ── Conservatives4MT supplemental-file processing ────────────────────────────
+
+def _parse_dollar(value: str) -> float:
+    """Parse '$3,858.99' or '3858.99' → float, empty/invalid → 0.0."""
+    try:
+        return float((value or "").strip().lstrip("$").replace(",", "") or "0")
+    except ValueError:
+        return 0.0
+
+
+# Parses the non-CSV body of a malformed edge-may row, e.g.:
+#   "$5338.58 Independent Expenditure Greg Kmetz SD 18 Oppose Mailing ..."
+_EDGE_MAY_BODY_RE = re.compile(
+    r"^\$([\d,]+(?:\.\d+)?)\s+Independent\s+Expenditure\s+(.+?)\s+(SD|HD)\s*(\d+)\b",
+    re.IGNORECASE,
+)
+
+
+def _make_c4mt_row(cand: dict, amount: float, out_fields: list) -> dict:
+    """Build a synthetic contested-primary output row for a C4MT expenditure."""
+    row = {f: "" for f in out_fields}
+    row["Committee"] = C4MT_COMMITTEE
+    row["Amount"] = f"{amount:.2f}"
+    row["Matched Candidate"] = cand["name_display"]
+    row["Matched District"] = cand["district_raw"]
+    row["Matched Party"] = cand["party"]
+    row["Matched Race"] = cand["race"]
+    return row
+
+
+def process_c4mt_files(
+    by_district: dict,
+    by_last: dict,
+    by_full: dict,
+    known_lasts: list,
+    out_fields: list,
+) -> list:
+    """
+    Read the three Conservatives4MT spending files and return matched rows in the
+    standard output format (same fields as committee-expenditures rows).
+
+    Files handled:
+      conservatives-4-mt-edge-spending-april.csv  – Candidate, Mail, Radio, Digital
+      conservatives-4-mt-edge-spending-may.csv    – Date, Amount, ..., Candidate, Office, ...
+      conservatives-4-mt-prosper-spending.csv     – Platform, District, Impressions, Amount Spent
+    """
+    rows: list = []
+    # Map district key → candidate dict; populated by name-bearing files so
+    # prosper (district-only) can resolve the correct candidate.
+    dist_to_cand: dict = {}
+
+    def _add(cand: dict, amount: float) -> None:
+        rows.append(_make_c4mt_row(cand, amount, out_fields))
+        dist_to_cand.setdefault(cand["district_key"], cand)
+
+    # ── Edge April: Candidate, Mail, Radio, Digital ───────────────────────────
+    if C4MT_EDGE_APRIL_FILE.exists():
+        with open(C4MT_EDGE_APRIL_FILE, newline="", encoding="utf-8-sig") as fh:
+            for row in csv.DictReader(fh):
+                name = row.get("Candidate", "").strip()
+                if not name:
+                    continue
+                amount = (
+                    _parse_dollar(row.get("Mail", ""))
+                    + _parse_dollar(row.get("Radio", ""))
+                    + _parse_dollar(row.get("Digital", ""))
+                )
+                if amount <= 0:
+                    continue
+                for cand in _match_one(name, by_district, by_last, by_full, known_lasts):
+                    _add(cand, amount)
+
+    # ── Edge May: Date, Amount, Type, Candidate, Office, Support/Oppose, ... ──
+    if C4MT_EDGE_MAY_FILE.exists():
+        with open(C4MT_EDGE_MAY_FILE, newline="", encoding="utf-8-sig") as fh:
+            reader = csv.reader(fh)
+            next(reader, None)  # skip header
+            for raw_row in reader:
+                if not raw_row:
+                    continue
+                amount = 0.0
+                name = ""
+                office = ""
+                if len(raw_row) >= 5:
+                    # Well-formed CSV: [Date, Amount, Type, Candidate, Office, ...]
+                    amount = _parse_dollar(raw_row[1])
+                    name = raw_row[3].strip()
+                    office = raw_row[4].strip()
+                elif len(raw_row) >= 2:
+                    # Malformed: spaces used instead of commas after the amount
+                    m = _EDGE_MAY_BODY_RE.match(raw_row[1])
+                    if m:
+                        amount = _parse_dollar(m.group(1))
+                        name = m.group(2).strip()
+                        office = f"{m.group(3)} {m.group(4)}"
+                if not name or amount <= 0:
+                    continue
+                # Build an issue string that includes the district so match_issue
+                # can use it for disambiguation.
+                issue = f"{name} {office}".strip() if office else name
+                candidates = match_issue(issue, by_district, by_last, by_full, known_lasts)
+                if not candidates:
+                    candidates = _match_one(name, by_district, by_last, by_full, known_lasts)
+                for cand in candidates:
+                    _add(cand, amount)
+
+    # ── Prosper: Platform, District, Impressions, Amount Spent ────────────────
+    if C4MT_PROSPER_FILE.exists():
+        # Aggregate across platforms per district
+        dist_amounts: dict = defaultdict(float)
+        with open(C4MT_PROSPER_FILE, newline="", encoding="utf-8-sig") as fh:
+            for row in csv.DictReader(fh):
+                district = row.get("District", "").strip().upper()
+                # Normalize "SD09" → "SD9", "HD05" → "HD5"
+                dm = re.match(r"^(SD|HD)0*(\d+)$", district)
+                if dm:
+                    district = f"{dm.group(1)}{int(dm.group(2))}"
+                dist_amounts[district] += _parse_dollar(row.get("Amount Spent", ""))
+
+        for district, amount in dist_amounts.items():
+            if amount <= 0:
+                continue
+            cand_info = dist_to_cand.get(district)
+            if cand_info:
+                rows.append(_make_c4mt_row(cand_info, amount, out_fields))
+            else:
+                # Fall back to the contested-primaries candidates index
+                dist_cands = by_district.get(district, [])
+                if dist_cands:
+                    rows.append(_make_c4mt_row(dist_cands[0], amount, out_fields))
+
+    return rows
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 
@@ -367,6 +507,13 @@ def main() -> None:
         all_matched_rows.append(out)
 
     print(f"  {matched_count} rows matched → {len(by_committee)} committees")
+
+    # Process supplemental Conservatives4MT spending files
+    c4mt_rows = process_c4mt_files(by_district, by_last, by_full, known_lasts, out_fields)
+    if c4mt_rows:
+        print(f"  Adding {len(c4mt_rows)} rows from Conservatives4MT supplemental files")
+        by_committee[C4MT_COMMITTEE].extend(c4mt_rows)
+        all_matched_rows.extend(c4mt_rows)
 
     # Write per-committee CSVs
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
